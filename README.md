@@ -1,2 +1,0 @@
-openclinica-rules-compiler
-==========================
