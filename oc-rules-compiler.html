@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html>
+  <!--
+    Copyright (C) 2013 Marco van Zwetselaar
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+    GNU General Public License for more details.
+  -->
+  <head>
+    <title>OpenClinica Rules Compiler</title>
+    <meta charset="utf-8">
+    <style type="text/css">
+body {
+    font-family: Verdana, Sans;
+    background-color: #CCC;
+    margin: 20px;
+}
+div#main {
+    background-color: #AAA;
+    padding: 5px 20px 20px;
+    margin: 0px;
+}
+div#div_output {
+    background-color: #AAA;
+}
+div#div_warnings {
+    background-color: #FCA;
+    padding: 5px 20px;
+    margin: 20px 0px;
+}
+div#div_error {
+    background-color: #FDD;
+    color: red;
+    padding: 0px 10px;
+}
+.hidden {
+    display: none;
+}
+button {
+    font-size: 100%;
+    margin-top: 15px;
+}
+
+#input {
+    background-color: #FFD;
+    color: #339;
+}
+#output {
+    background-color: #FFF;
+    color: #000;
+}
+    </style>
+    <script type="application/javascript">
+"use strict";
+
+function make_compiler () {
+  
+  return {
+
+    _error: undefined,
+    _ruledefs: {},      // a rule at every index [oid]
+    _assignments: {},   // a rule reference at every index [tgt][#]
+
+    // create a rule with oid for item with msg and expression
+    // and rewrite NOT:, DISABLED:, $T, $E, $N, $IN, $NOT, $SOME.
+    _create_rule: function (oid, itm, msg, exp) {
+      var disabled_match = /^DISABLED:(.*)/.exec(exp);
+      if (disabled_match !== null) {
+        exp = disabled_match[1];
+      }
+      var not_match = /^NOT:(.*)/.exec(exp);
+      if (not_match !== null) {
+        exp = not_match[1];
+      }
+      return {
+        oid: oid,
+        mesg: msg.trim(),
+        expr: exp
+          .replace(/(\s+ct\s+)(\d+)(\s*)/g,"$1'$2'$3") // common mistake: ct must have string arg
+          .replace(/\$T/g, itm)
+          .replace(/\$E/g, itm + ' eq ""')
+          .replace(/\$N(?!OT)/g, itm + ' ne ""') // need to exclude accidentally replacing $NOT
+          .replace(/'/g,'"')
+          .replace(/(\w+)\s+\$(IN|NOT|SOME)\s*\((\s*\d+\s*(?:,\s*\d+\s*)*)\)/g, function(m,m1,m2,m3) {
+            var oper, conn, term;
+            switch (m2) {
+              case "IN": oper = " eq "; conn = " or "; term = ")"; break;
+              case "NOT": oper = " ne "; conn = " and "; term = ")"; break;
+              case "SOME": oper = " ct \""; conn = "\" or "; term = "\")"; break;
+            }
+            return "(" + m1 + oper + m3.replace(/,/g, conn + m1 + oper) + term;
+          })
+          .replace(/\$(IN|NOT|SOME)\s*\(.*\)/, function() { 
+            throw "the $IN, $NOT and $SOME operators can only be used with positive decimals";
+          })
+          .trim(),
+        firewhen: not_match !== null,
+        disabled: disabled_match !== null,
+        assigned: false
+      };
+    },
+
+    // create ruledef for itm, add to _ruledefs and return the ruledef
+    _add_ruledef: function (itm, id, msg, exp) {
+      var oid = "R_" + itm + "_" + id;
+      var rule = this._ruledefs[oid];
+      if (rule) {
+        if (rule.msg != msg || rule.exp != exp) {
+          throw "rule with Rule OID exists: " + oid;
+        }
+        // else silently ignore
+      }
+      else {
+        rule = this._ruledefs[oid] = this._create_rule(oid,itm,msg,exp);
+      }
+      return rule;
+    },
+
+    // add rule assignment to _assignments
+    _add_assignment: function (se, crf, grp, itm, rule) {
+      var tgt = se + "." + crf + "." + grp + "." + itm;
+      var asstarr = this._assignments[tgt] || (this._assignments[tgt] = []);
+      rule.assigned = true;
+      asstarr.push(rule);
+    },
+
+    // check input for common JSON syntax issues (JSON object doesn't report well)
+    // return a list of potential issues
+    _check_json_syntax: function (str) {
+      var result = [];
+      var lines = str.split("\n");
+      var prev_line = ""
+      var prev_n = -1;
+      while (prev_line.length === 0 && ++prev_n < lines.length) {
+        prev_line = lines[prev_n].replace(/\/\/.*/,"").trim();
+      }
+      var cur_n = prev_n
+      while (++cur_n < lines.length) {
+        var cur_line = lines[cur_n].replace(/\/\/.*/,"").trim();
+        if (cur_line.length !== 0) {
+          switch (prev_line.charAt(prev_line.length - 1) + cur_line.charAt(0)) {
+            case '""': case '"{': case '"[': 
+            case "''": case "'{": case "'[":
+              result.push("line " + (prev_n+1) + ": comma or colon missing after: " + prev_line);
+              break;
+            case '}{': case '}"': case ']"':
+            case '][': case "}'": case "]'":
+              result.push("line " + (prev_n+1) + ": comma missing after: " + prev_line);
+              break;
+            case ',}': case ',]':
+              result.push("line " + (prev_n+1) + ": stray comma after: " + prev_line);
+              break;
+          }
+          prev_line = cur_line;
+          prev_n = cur_n;
+        }
+      }
+      return result;
+    },
+
+    // main work horse doing the parsing after json has been parsed
+    _parse: function (toplevel) {
+      var _this = this;
+      Object.getOwnPropertyNames(toplevel).forEach( function(crf_key) {
+        if (!/^F_[A-Z0-9_]+$/.test(crf_key)) throw "not a valid CRF OID: '" + crf_key + "'"
+        var crf_obj = toplevel[crf_key];
+        Object.getOwnPropertyNames(crf_obj).forEach( function(ses_key) {
+          var se_arr = ses_key.split(",").map( function(se_oid) {
+            if (!/^SE_[A-Z0-9_]+(\[\d+\])?$/.test(se_oid)) throw "not a valid SE OID: '" + se_oid + "'";
+            return se_oid;
+          });
+          var ses_obj = crf_obj[ses_key];
+          Object.getOwnPropertyNames(ses_obj).forEach( function(grp_key) {
+            if (!/^IG_[A-Z0-9_]+(\[\d+\])?$/.test(grp_key)) throw "not a valid Group OID: '" + grp_key + "'";
+            var grp_obj = ses_obj[grp_key];
+            Object.getOwnPropertyNames(grp_obj).forEach( function(itm_key) {
+              if (!/^I_[A-Z0-9_]+$/.test(itm_key)) throw "not a valid Item OID: '" + itm_key + "'";
+              var itm_obj = grp_obj[itm_key];
+              Object.getOwnPropertyNames(itm_obj).forEach( function(rul_key) {
+                var match = /(\w+)\s*\|\s*(.*)$/.exec(rul_key);
+                if (!match) throw "not a valid rule key, it must match 'ID | Message': '" + rul_key + "'";
+                var rule = _this._add_ruledef(itm_key, match[1], match[2], itm_obj[rul_key]);
+                se_arr.forEach( function(se) {
+                  _this._add_assignment(se,crf_key,grp_key,itm_key,rule);
+                });
+              });
+            });
+          });
+        });
+      });
+      return true;
+    },
+
+    // reset state of the compiler to initial
+    reset: function () {
+      this._error = undefined;
+      this._assignments = {};
+      this._ruledefs = {};
+    },
+
+    // compile the input string, returning boolean success
+    compile: function(input) {
+      this.reset();
+      try {
+        try {
+          var toplevel = JSON.parse(input.replace(/\/\/.*\n/g,""));
+        }
+        catch (je) {
+          var causes = this._check_json_syntax(input);
+          var res = je.toString() + ". Possible causes:";
+          res += causes.length ? "<ul><li>" + causes.join("</li><li>") + "</li></ul>" : " braces not pairing up.";
+          throw res;
+        }
+        if (!typeof(toplevel === "object")) {
+          throw "invalid input: expected top level object.";
+        }
+        return this._parse(toplevel);
+      }
+      catch(e) {
+        this._error = e.toString();
+        return false;
+      }
+    },
+
+    // return xml string representing all assignments
+    _output_assignments: function () {
+      function output_assignment(tgt,rules) {
+        function output_ruleref(rule) {
+          return "    <" + (rule.disabled ? "!-- DISABLED " : "") + "RuleRef OID='" + rule.oid + "'>\n" +
+          "      <DiscrepancyNoteAction IfExpressionEvaluates='" + rule.firewhen + "'>\n" +
+          "        <Run AdministrativeDataEntry='true' InitialDataEntry='true' DoubleDataEntry='true' ImportDataEntry='false' Batch='true' />\n" +
+          "        <Message>" + rule.mesg + "</Message>\n" +
+          "      </DiscrepancyNoteAction>\n" +
+          "    </RuleRef" + (rule.disabled ? " -->\n" : ">\n");
+        }
+        return rules.every(function(r) {return r.disabled;}) ?
+        "  <!-- INACTIVE RuleAssignment " + tgt + " -->\n"
+        :
+        "  <RuleAssignment>\n" +
+        "    <Target Context='OC_RULES_V1'>" + tgt + "</Target>\n" +
+        rules.map(output_ruleref).join("") +
+        "  </RuleAssignment>\n";
+      }
+      return [output_assignment(tgt, this._assignments[tgt]) for (tgt of Object.getOwnPropertyNames(this._assignments))].join("");
+    },
+
+    // return xml string representing all ruledefs
+    _output_ruledefs: function () {
+      function output_ruledef (rule) {
+        return "  <" + (rule.disabled ? "!-- DISABLED " : (!rule.assigned ? "!-- UNUSED " : "")) + "RuleDef OID='" + rule.oid + "'>\n" +
+        "    <Description>" + (rule.firewhen ? "NOT: " : "") + rule.mesg + "</Description>\n" +
+        "    <Expression>" + rule.expr + "</Expression>\n" +
+        "  </RuleDef" + (rule.disabled || !rule.assigned ? " -->\n" : ">\n");
+      }
+      return [output_ruledef(this._ruledefs[oid]) for (oid of Object.getOwnPropertyNames(this._ruledefs))].join("");
+    },
+          
+    // return the compiler output, undefined if there is an error
+    output: function () {
+      if (!this._error) {
+        var res = "<RuleImport>\n";
+        res += this._output_assignments();
+        res += this._output_ruledefs();
+        res += "</RuleImport>";
+        return res;
+      }
+    },
+
+    // return the compiler error output, undefined if none
+    error: function () {
+      return this._error;
+    }
+  }
+}
+
+window.onload = function () {
+
+  var compiler = make_compiler();
+  var current_file = undefined;
+  var input_present = false;
+  var input_div = document.getElementById("div_input");
+  var input_area = document.getElementById("input");
+  var output_div = document.getElementById("div_output");
+  var output_area = document.getElementById("output");
+  var error_div = document.getElementById("div_error");
+  var error_span = document.getElementById("error");
+  var compile_btn = document.getElementById("compile_btn");
+  var file_input = document.getElementById("file_input");
+  var file_btn = document.getElementById("file_btn");
+  var reload_btn = document.getElementById("reload_btn");
+  var example_btn = document.getElementById("example_btn");
+  var clear_btn = document.getElementById("clear_btn");
+  var back_btn = document.getElementById("back_btn");
+  var select_btn = document.getElementById("select_btn");
+
+  function read_input () {
+    return input_area.value;
+  }
+
+  function show_input (str) {
+    show_output(null);
+    if (str !== undefined) {
+      input_area.value = str ? str : "";
+    }
+    input_area.setSelectionRange(0,0);
+    input_area.focus();
+    update_buttons();
+  }
+
+  function show_output (str) {
+    if (str) {
+      output_area.value = str;
+      input_div.className = "hidden";
+      output_div.className = "";
+      output_area.setSelectionRange(0,0);
+      output_area.focus();
+    }
+    else {
+      output_area.value = "";
+      input_div.className = "";
+      output_div.className = "hidden";
+    }
+  }
+
+  function show_error (str) {
+    error_span.innerHTML = str ? str : "";
+    error_div.className = str ? "" : "hidden";
+  }
+
+  function update_buttons () {
+    var old_input_present = input_present;
+    input_present = input_area.value.length !== 0;
+    if (input_present != old_input_present) {
+      if (input_present) {
+        compile_btn.className = "";
+        clear_btn.className = "";
+        example_btn.className = "hidden";
+      }
+      else {
+        compile_btn.className = "hidden"
+        clear_btn.className = "hidden";
+        example_btn.className = "";
+      }
+      reload_btn.className = current_file ? "" : "hidden";
+    }
+  }
+
+  function handle_file (filename) {
+    var reader = new FileReader();
+    reader.onload = (function(fname) { 
+      return function (ev) {
+        current_file = fname;
+        show_input(ev.target.result);
+      };
+    })(filename);
+    clear_btn.click();
+    reader.readAsText(filename);
+  }
+
+  compile_btn.addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    var input = read_input();
+    if (compiler.compile(input)) {
+      show_output(compiler.output());
+    }
+    else {
+      show_error(compiler.error());
+    }
+  }, false);
+
+  clear_btn.addEventListener("click", function(ev) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    current_file = undefined;
+    show_input("");
+  }, false);
+
+  back_btn.addEventListener("click", function (ev) { 
+    ev.stopPropagation();
+    ev.preventDefault();
+    show_input();
+  }, false);
+
+  select_btn.addEventListener("click", function (ev) { 
+    ev.stopPropagation();
+    ev.preventDefault();
+    output.focus();
+    output.select();
+  }, false);
+
+  file_input.addEventListener("change", function(ev) {
+    if (ev.target.files.length === 1) {
+      handle_file(ev.target.files[0]);
+    }
+  }, false);
+
+  file_btn.addEventListener("click", function(ev) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    file_input.click();
+  }, false);
+
+  reload_btn.addEventListener("click", function(ev) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    if (current_file) {
+      handle_file(current_file);
+    }
+  }, false);
+
+  example_btn.addEventListener("click", function(ev) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    current_file = undefined;
+    show_input(document.getElementById("example_input").textContent);
+  }, false);
+  
+  input_area.addEventListener("input", function(ev) {
+    update_buttons();
+  }, false);
+
+  input_area.addEventListener("dragover", function(ev) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = 'copy';
+  }, false);
+
+  input_area.addEventListener("drop", function (ev) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    if (ev.dataTransfer.files === 1) {
+      handle_file(ev.dataTransfer.files[0])
+    }
+  }, false);
+
+  show_input("");
+}
+    </script>
+  </head>
+  <body>
+    <h1 id="title">OpenClinica Rules Compiler</h1>
+    <div id="main">
+      <div id="div_input">
+        <p>Input:</p>
+        <textarea id="input" rows="25" cols="100"></textarea>
+        <div>
+          <button id="compile_btn">Compile</button>
+          <button id="reload_btn" class="hidden">Reload</button>
+          <input id="file_input" type="file" style="display:none"></input>
+          <button id="file_btn">Open ...</button>
+          <button id="example_btn">Example</button>
+          <button id="clear_btn" class="hidden">Clear</button>
+        </div>
+        <div id="div_error" class="hidden">
+          <p><b>Error:</b> <span id="error"></span></p>
+        </div>
+      </div>
+      <div id="div_output" class="hidden">
+        <p>Output</p>
+        <textarea id="output" rows="25" cols="100" readonly="true"></textarea>
+        <div>
+          <button id="back_btn">&lt;&lt; Back</button>
+          <button id="select_btn">Select All</button>
+        </div>
+      </div>
+    </div>
+    <div id="example_input" style="display:none">// --------------------------------------------------------------------------------------------
+// Annotated sample input for the "OpenClinica Rules Compiler".
+//
+// WHAT IS THE OC RULES COMPILER?
+//
+// The OC rules compiler reads a simplified declaration of a set of validation rules and
+// generates an OpenClinica RuleImport XML document.  In its current incarnation it
+// supports only DiscrepancyNoteActions, and the RuleAssignments it generates are defined
+// to run on all events (initial, double, administrative data entry and batch).
+//
+// Though the rules compiler could easily be extended with more configurability and 
+// functionality, that would also add complexity to its input syntax.  The intention when
+// writing this compiler was to be able to express the most common type of rules in the
+// simplest and most concise way possible.
+//
+// This guide assumes you are already familiar with OpenClinica Rules.  Even if you are, 
+// then the documentation which follows may be somewhat dense.  You may want to skip to
+// the annotated example at the bottom, then later refer back to this documentation.
+// Note that you can compile this sample by pressing the "Compile" button below.
+//
+// SYNTAX
+//
+// The input to the rule compiler is a nested collection of objects, specified in JSON
+// (http://www.json.org).  For reference, the JSON syntax to define an object is as follows:
+//
+//   {                              - OPENING BRACE
+//     "property1" : value1,        - QUOTED property name COLON property value COMMA
+//     "property2" : value2         - ... more property definitions, NO comma after last
+//   }                              - CLOSING BRACE
+//
+// Property names must be quoted.  They must be unique within their object, or else the 
+// second definition (silently) wins.  Property values can be any JSON type, though we use
+// only string and object values.  Properties must be separated by commas.
+//
+// GRAMMAR
+//
+// The input is a collection of rulesets assigned to target items.  The target items are
+// specified using a hierarchy of nested objects: CRF / Study Events / Item Group / Item.
+// Rulesets are implemented simply as properties of their target item. Each rule in a set 
+// has this format: "ID | Message" : "Expression", where ID must uniquely identify the rule
+// within the scope of its target item; Message is the text which will be shown in the DN
+// when the rule fails; Expression is the OC expression which must hold.
+//
+// RULE IDs and OIDs
+//
+// The ID before the | in the message must consist of alphanumerics and/or underscores.
+// It must be unique across all target items with the same I_xxx OID.  The compiler creates
+// Rule OID's by appending "R_" [ItemOID] "_" [RuleID].
+//
+// RULE EXPRESSIONS
+//
+// Rule expressions are essentially those you write in OC RuleImport XML, except that you
+// must use apostrophes (') where OC expressions have quotes (").  Also, we add some
+// syntactic sugar to provide shorthand for common expressions (examples shown below):
+//
+//  1. $T expands to the target of the rule expression, allowing for: "$T eq 1 or $T eq 2"
+//  2. $E expands to ($T eq ''), i.e. target must be blank (empty)
+//  3. $N expands to ($T ne ''), i.e. target must not be blank
+//  4. X $IN (1,2,..) expands to (X eq 1 or X eq 2 or ..).
+//  5. X $NOT (1,2,..) expands to (X ne 1 and X ne 2 and ..).
+//  6. X $SOME (1,2,..) expands to (X ct 1 or X ct 2 or ..).  (Note: ct is the undocumented 
+//     operator "contains", which is like 'eq' but can be used with multi-valued variables.)
+//  NOTE: the $IN, $NOT and $SOME can only be used with non-negative integral numbers.
+//  7. NOT: before an expression inverts its logic by assigning it to its target with
+//     attribute IfExpressionEvaluates set to false.
+//  8. DISABLED: before an expression disables the rule: it will be commented out in the
+//     generated XML (but see CAVEATS below about removing rules).
+//
+// CAVEATS
+//
+// Be aware of the following points when you reimport a modified ruleset:
+// * Rule imports in OC can only add or modify (but not remove) rules and rule assignments.
+//   To remove a rule assignment, you must use OC's "Manage Rules" module.  (Incidentally,
+//   OC offers no way to remove a rule itself.)
+//    - This means that removing a rule by disabling or removing it in the compiler input
+//      will *not* remove the assignment in OC.
+// * A rule import in OC cannot change the target of a rule assignment, only its actions.
+//   Importing a RuleImport XML with a different target for a rule will leave the previous
+//   assignment intact and add a new one.
+//    - This means that changing the F_ (CRF), SE_ (Study Event), IG_ (Group) or I_ (Item)
+//      in the compiler input will create an new set of assignments for all contained
+//      rules.  (One exception: changing e.g. "SE_A,SE_B" to "SE_A" is okay.)
+// * Rules in OC must have a unique and unchanging Rule OID.  Since the compiler creates 
+//   these by appending RuleID to ItemOID, Rule ID's must be unique across all ItemOIDs
+//   with the same name.
+// * Do not change rule IDs, they are part of the Rule OID so they too must be invariant.
+//  
+// This program is Copyright (c) 2013 Marco van Zwetselaar, KCRI, Tanzania &lt;zwets@kcri.ac.tz&gt;
+// and licensed under the GNU General Public License (GPL) version 2.
+// OpenClinica is Copyright (c) OpenClinica LLC and collaborators, Waltham, MA, USA.
+// --------------------------------------------------------------------------------------------
+
+// Input starts with the opening brace of the 'top-level object'.
+{
+  // The top-level has an "F_" member for each CRF and/or CRF Version it contains rules for.
+  "F_TESTCRF" :
+  {
+    // Inside it is a comma-separated list of SE's to assign the contained rules to.
+    // There may be multiple "SE_xxx,SE_..." properties, each listing different SE's.
+    // Use the SE_xxx[n] notation to refer to instances of repeating SEs.
+    "SE_TESTEVENT,SE_ANOTHEREVENT" :
+    {
+      // Each "IG_" property simply groups the items it is defined to group in the CRF.
+      // Use the IG_xxx[n] notation to refer to instances of repeating groups.
+      "IG_TESTC_UNGROUPED" :
+      {
+        // Each "I_" property is the OID of an item which is the target of a set of rules.
+        "I_TEST_ITEM_1" :
+        {
+          // Inside here are the actual rules:
+          // Every rule is a pair of a rule key and a rule expression.
+          // The key consists of an ID and a message, separated by a vertical bar.
+          // The ID must be alphanumeric and unique across all items with the same I_OID.
+          // The message will be the content of the discrepancy note which gets created
+          // when the expression fails.
+          // The expression uses OC syntax plus some niceties.
+
+          "01| A response must be given" : "$N",
+          "02| This field must be blank" : "$E",
+          "03| This rule is equivalent to the one before" : "NOT: $N",
+          "04| Response must be either Yes or No" : "$T eq 1 or $T eq 2",
+          "05| Shorter equivalent to the previous" : "$T $IN (1,2)",
+          "06| Response must not be 3 or 4" : "$T $NOT (3,4)",
+          "07| The inverse formulation of the previous" : "NOT: $T $IN (3,4)",
+          "08| This rule is disabled" : "DISABLED: $T eq 1 or $T eq 2"
+        },
+
+        // The second item in the group
+        "I_TEST_ITEM_2" :
+        {
+          // Note: the IDs here don't collide with those of the rules on the previous item,
+          // because their target item is different.
+          // Generated Rule OID's will be R_I_TEST_ITEM_1_01 versus R_I_TEST_ITEM_2_01.
+
+          "01| Rule for a multivalued item" : "I_TEST_ITEM_1 eq '' or $T ct 1 or $T ct 2",
+          "02| Shorthand for the previous rule" : "I_TEST_ITEM_1 eq '' or $T $SOME (1,2)",
+          // OC has no "does not contain" operator, so the following is the only way to 
+          // express that some multivalued rule must not have option 1 checked
+          "03| Option 1 must not be checked" : "NOT: $T ct 1",
+          "04| Combining: none of these may be checked" : "NOT: $T $SOME (1,2)"
+        },
+
+        // The third item in the group
+        "I_TEST_ITEM_3" :
+        {
+          // The Rule IDs need not be numeric, they can also be mnemonics:
+          "BLNK| The field must be blank" : "$E",
+          "FILL| The field must not be blank" : "$N"
+        }
+      },
+      // ... more groups can follow here
+      "IG_ANOTHER" : { }
+    },
+    // ... more SE lists can follow here
+    "SE_TESTEVENT" : { }
+  },
+  // ... more CRFs or CRF Versions can follow here
+  "F_TESTCRF_V01" : { }
+}
+    </div>
+  </body>
+  <!-- 
+  vim:sts=2:sw=2:ai:si:et: 
+  -->
+</html>
+
