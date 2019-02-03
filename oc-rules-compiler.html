@@ -248,7 +248,7 @@ function make_compiler () {
         rules.map(output_ruleref).join("") +
         "  </RuleAssignment>\n";
       }
-      return [output_assignment(tgt, this._assignments[tgt]) for (tgt of Object.getOwnPropertyNames(this._assignments))].join("");
+      return Object.getOwnPropertyNames(this._assignments).map(tgt => output_assignment(tgt, this._assignments[tgt])).join("");
     },
 
     // return xml string representing all ruledefs
@@ -259,7 +259,7 @@ function make_compiler () {
         "    <Expression>" + rule.expr + "</Expression>\n" +
         "  </RuleDef" + (rule.disabled || !rule.assigned ? " -->\n" : ">\n");
       }
-      return [output_ruledef(this._ruledefs[oid]) for (oid of Object.getOwnPropertyNames(this._ruledefs))].join("");
+      return Object.getOwnPropertyNames(this._ruledefs).map(oid => output_ruledef(this._ruledefs[oid])).join("");
     },
           
     // return the compiler output, undefined if there is an error
